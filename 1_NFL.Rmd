@@ -1,0 +1,282 @@
+---
+title: "1. NFL"
+author: "G. Versteeg (based on Silge)"
+date: "02/01/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = TRUE,
+                      cache = TRUE, dpi = 180, fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(tidymodels)
+## library(silgelib)
+## theme_set(theme_plex())
+```
+
+We build a very simple model based on TidyTuesdays dataset for the NFL.
+
+
+## Housekeeping en reading data
+Our goal here is to build some very simple models for NFL attendance from this week’s #TidyTuesday dataset. First, we’ll read in the two files and join them together.
+
+```{r housekeeping}
+dir_data <- "data/"
+dir_raw <- paste0(dir_data, "raw/")
+base_url <- "https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/"
+date_url <- "2020/2020-02-04/"
+
+fname_in1 <- "attendance.csv"
+fpath_in1 <- paste0(base_url, date_url, fname_in1)
+fpath_raw1 <- paste0(dir_data, fname_in1)
+
+fname_in2 <- "standings.csv"
+fpath_in2 <- paste0(base_url, date_url, fname_in2)
+fpath_raw2 <- paste0(dir_data, fname_in2)
+
+attendance <- read_csv(fpath_in1)
+write_csv(attendance, fpath_raw1)
+standings <- read_csv(fpath_in2)
+write_csv(standings, fpath_raw2)
+
+attendance_joined <- attendance %>%
+  left_join(standings,
+            by = c("year", "team_name", "team")
+  )
+
+attendance_joined
+
+```
+
+
+## Explore data
+You can read more at the [data dictionary](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-02-04/readme.md#data-dictionary), but notice that we have information on weekly attendance at NFL games, along with characteristics of team records per season such as SRS (Simple Rating System), how many points were scored for/against teams, whether a team made the playoffs, and more. Let’s build a model to predict weekly attendance.
+
+How does weekly attendance vary for different teams, and for the seasons they did/did not make the playoffs?
+
+```{r explore_01}
+attendance_joined %>%
+  filter(!is.na(weekly_attendance)) %>%
+  ggplot(aes(fct_reorder(team_name, weekly_attendance),
+    weekly_attendance,
+    fill = playoffs
+  )) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  coord_flip() +
+  labs(
+    fill = NULL, x = NULL,
+    y = "Weekly NFL game attendance"
+  )
+```
+
+Notice that for the 32 teams in the NFL, we have years they all did and did not make the playoffs, which will be nice for modeling.
+
+How much does **margin_of_victory**, a measure of points scored relative to points allowed, measure the same thing as getting to the playoffs?
+
+
+```{r explore_02}
+attendance_joined %>%
+  distinct(team_name, year, margin_of_victory, playoffs) %>%
+  ggplot(aes(margin_of_victory, fill = playoffs)) +
+  geom_histogram(position = "identity", alpha = 0.7) +
+  labs(
+    x = "Margin of victory",
+    y = "Number of teams",
+    fill = NULL
+  )
+```
+Both historgrams of the values playoffs and no_playoffs are plotted on the X-axis, therefore we need `position = "identity"`.
+
+Are there changes with the week of the season?
+
+```{r explore_03}
+attendance_joined %>%
+  mutate(week = factor(week)) %>%
+  ggplot(aes(week, weekly_attendance, fill = week)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.5) +
+  labs(
+    x = "Week of NFL season",
+    y = "Weekly NFL game attendance"
+  )
+```
+
+Maybe a bit.
+
+This is some initial exploratory data analysis for this dataset, always an important part of a modeling task. To see more examples of EDA for this dataset, you can see the [amazing work](https://twitter.com/hashtag/tidytuesday) that folks share on Twitter. The next step for us here is to create a dataset for modeling.
+
+Let’s remove the weeks that each team did not play (where the weekly attendance is NA).
+Let’s only keep columns for modeling that we want to use for modeling. For example, we will keep **margin_of_victory** and **strength_of_schedule**, but not **simple_rating** which is the sum of those first two quantities.
+
+```{r explore_04}
+attendance_df <- attendance_joined %>%
+  filter(!is.na(weekly_attendance)) %>%
+  select(weekly_attendance, team_name, year, week,
+    margin_of_victory, strength_of_schedule, playoffs)
+
+attendance_df
+```
+
+
+## Train model
+
+Now it is time to load the tidymodels metapackage! 💪 The first step here is to split our data into training and testing tests. We can use the function  `initial_split()` to create these datasets, divided so that they each have about the same number of examples of teams that went on to the playoffs. By default the data gets split in 75% training en 25% test set.
+
+We use `strata` in the split function, because we want to split the data evenly accross a certain variable, in this case `playoffs`. So there will be an equal proportion of playoffs versus no-playoffs in both the training en testing set.
+
+```{r split_data}
+set.seed(1234)
+attendance_split <- attendance_df %>%
+  initial_split(strata = playoffs)
+
+nfl_train <- training(attendance_split)
+nfl_test <- testing(attendance_split)
+
+```
+
+Now we can **specify** and then **fit** our models. One of the significant problems that tidymodels solves is how so many modeling packages and functions in R have different inputs, calling sequences, and outputs. The code below might look like overkill to fit linear regression using OLS, but we can use the same framework to fit a regression model using Stan, using regularization, etc. The functions in tidymodels are designed to be composable and consistent.
+
+First we will start with a commmon, simple linear model, where we predict weekly_attendance from all other variables in the dataset.
+
+```{r linear}
+## specify the model to be used
+lm_spec <- linear_reg() %>%
+  set_engine(engine = "lm")
+
+## fit the specified model to the training set
+lm_fit <- lm_spec %>%
+  fit(weekly_attendance ~ ., data = nfl_train)
+
+lm_fit
+
+```
+
+Let's play around a bit with this linear model using tidymodels' functions.
+
+```{r play}
+## shows the model in a tidy way (estimates, error, stat and p-value)
+tidy(lm_fit) %>% arrange(estimate)
+
+```
+
+Secondly we proceed with a random forest model. It can be usewd for classification of regression so we need to specify wich one, when we specificy the model. We will use the 'ranger' package to perform the fit with the random forest specification.
+
+```{r random}
+## specify the model to be used
+rf_spec <- rand_forest(mode = "regression") %>%
+  set_engine("ranger")
+
+## fit the specified model to the training set
+rf_fit <- rf_spec %>%
+  fit(weekly_attendance ~ .,
+    data = nfl_train)
+
+rf_fit
+```
+
+Notice that we have fit both of these models using nfl_train, the training data. We haven’t touched the testing data during training.
+
+
+## Evaluate model
+
+When it’s time to evaluate our models (to estimate how well our models will perform on new data), then we will look at nfl_test. We can `predict()` what the weekly attendance will be for both the training data and the testing data using both the OLS and random forest models. One of the goals of tidymodels is to be able to use code like the following in predictable, consistent ways for many kinds of models, and to use existing well-suited tidyverse tools for these kinds of tasks.
+
+We will make predictions for both models and combine them in one dataset (results_train). This makes it easy to show the differences between the model-results in one plot.
+
+After that we usually do all kinds of tweaking to optimize (train) the two models, but in this case we will skip this optimization and also run the predictions on the test set.
+
+```{r predict}
+results_train <- lm_fit %>%
+  predict(new_data = nfl_train) %>%
+  mutate(truth = nfl_train$weekly_attendance,
+         model = "lm" ) %>%
+  bind_rows(rf_fit %>%
+    predict(new_data = nfl_train) %>%
+    mutate(truth = nfl_train$weekly_attendance,
+           model = "rf" ))
+
+results_test <- lm_fit %>%
+  predict(new_data = nfl_test) %>%
+  mutate(truth = nfl_test$weekly_attendance,
+         model = "lm") %>%
+  bind_rows(rf_fit %>%
+    predict(new_data = nfl_test) %>%
+    mutate(truth = nfl_test$weekly_attendance,
+           model = "rf"))
+
+```
+
+For this regression model, let’s look at the `rmse` (root mean squared error) for what we’ve done so far. 
+
+```{r rmse}
+results_train %>%
+  group_by(model) %>%
+  rmse(truth = truth, estimate = .pred)
+
+results_test %>%
+  group_by(model) %>%
+  rmse(truth = truth, estimate = .pred)
+
+```
+
+If we look at the training data, the random forest model performed much better than the linear model; the rmse is much lower. However, the same cannot be said for the testing data! 
+
+The metric for training and testing for the linear model is about the same, meaning that we have not overfit. For the random forest model, the rmse is higher for the testing data than for the training data, by quite a lot. Our training data is not giving us a good idea of how our model is going to perform, and this powerful ML algorithm has overfit to this dataset.
+
+Let’s visualize our sad situation.
+
+```{r plot}
+results_test %>%
+  mutate(train = "testing") %>%
+  bind_rows(results_train %>%
+    mutate(train = "training")) %>%
+  ggplot(aes(truth, .pred, color = model)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~train) +
+  labs(
+    x = "Truth",
+    y = "Predicted attendance",
+    color = "Type of model"
+  )
+
+```
+
+We made not such a great decision in the previous section; we expected the random forest model evaluated one time on the whole training set to help us understand something about how it would perform on new data. This would be a reasonable expectation for the linear model, but not for the random forest.
+
+## Optimize the rf-model with cross-validation using resampling
+Fortunately, we have some options. We can resample the training set to produce an estimate of how the model will perform on new data. By using 10 samples (folds) of about 765 observations, we can train the model on nine of them and then check the predictions on the tenth fold. Trying this 10 times, will help us selects a rf that is better at predicting on new data (i.c. that is not overfitted on the training data).
+
+Let’s divide our training set nfl_train into folds (say, 10) and fit 10 versions of our model (each one trained on nine folds and evaluated on one heldout fold). Then let’s measure how well our model(s) performs. 
+
+The function `vfold_cv()` creates folds for cross-validation and keeps track of which observations are in which fold. The function `fit_resamples()` fits models to resamples such as these (to measure performance), and then we can `collect_metrics()` from the result.
+
+
+```{r resample}
+set.seed(1234)
+nfl_folds <- vfold_cv(nfl_train, strata = playoffs)
+
+rf_res <- fit_resamples(rf_spec, weekly_attendance ~ ., nfl_folds, 
+                        control = control_resamples(save_pred = TRUE)) 
+
+rf_res %>%
+  collect_metrics()
+
+```
+
+Remember that this is still the training dataset. We would take this step instead of the chunk above with `predict(new_data = nfl_train)`, and we would still compare to how the model performs on the testing data. Notice that now we have a realistic estimate from the training data that is close to the testing data! We can even visualize our model results for the resamples.
+
+Let's plot the truth versus the predictions of all ten folds, to visualize the results of our resampling effort.
+
+```{r show}
+rf_res %>%
+  unnest(.predictions) %>%
+  ggplot(aes(weekly_attendance, .pred, color = id)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Truth",
+    y = "Predicted game attendance",
+    color = NULL
+  )
+
+```
